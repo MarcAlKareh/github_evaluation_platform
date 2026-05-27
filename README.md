@@ -1,0 +1,1 @@
+An AI-powered technical candidate evaluation platform that analyzes GitHub profiles and ranks candidates based on role fit and engineering quality.
