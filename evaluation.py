@@ -1,6 +1,10 @@
 """
 GitHub candidate evaluation — fetch public profile data and score role fit.
 
+Usage:
+    python evaluation.py <role> <username1> [username2] ...
+    python evaluation.py torvalds backend          (legacy: username then role)
+
 Roles: backend, frontend, ml, devops
 """
 
@@ -572,56 +576,51 @@ def build_explanation(
     return text[0].upper() + text[1:] + "."
 
 
-def parse_role(argv: list[str]) -> dict:
-    """Role is the second argument; default to backend if omitted."""
-    if len(argv) > 2:
-        role_key = argv[2].lower()
-    else:
-        role_key = "backend"
+def parse_cli(argv: list[str]) -> tuple[dict, list[str]]:
+    """
+    Parse command-line args into a role profile and one or more usernames.
 
-    if role_key not in ROLE_PROFILES:
+    Preferred:  python evaluation.py frontend gaearon torvalds
+    Legacy:     python evaluation.py gaearon frontend
+                python evaluation.py gaearon
+    """
+    valid_roles = set(ROLE_PROFILES.keys())
+
+    if len(argv) < 2:
         valid = ", ".join(ROLE_PROFILES.keys())
-        print(f"Unknown role '{role_key}'. Choose one of: {valid}")
-        sys.exit(1)
-
-    return ROLE_PROFILES[role_key]
-
-
-def main() -> None:
-    if len(sys.argv) < 2:
-        valid = ", ".join(ROLE_PROFILES.keys())
-        print(f"Usage: python evaluation.py <github_username> [role]")
+        print(f"Usage: python evaluation.py <role> <username1> [username2] ...")
         print(f"Roles: {valid}")
         sys.exit(1)
 
-    username = sys.argv[1].lstrip("@")
-    role_profile = parse_role(sys.argv)
+    first = argv[1].lower()
 
-    try:
-        user = get_user(username)
-        repos = get_repos(username)
-        public_events = get_public_events(username)
-    except requests.HTTPError as e:
-        print(f"Error: {e.response.status_code} — {e.response.json().get('message', e)}")
+    # New style: role first, then all usernames
+    if first in valid_roles:
+        role_key = first
+        usernames = [name.lstrip("@") for name in argv[2:]]
+    # Legacy: username first, optional role as second arg
+    elif len(argv) > 2 and argv[2].lower() in valid_roles:
+        role_key = argv[2].lower()
+        usernames = [argv[1].lstrip("@")]
+    else:
+        role_key = "backend"
+        usernames = [argv[1].lstrip("@")]
+
+    if not usernames:
+        print("Error: provide at least one GitHub username after the role.")
         sys.exit(1)
 
-    projects = top_projects(repos)
+    return ROLE_PROFILES[role_key], usernames
 
-    print("Inspecting top repos for engineering signals...", file=sys.stderr)
+
+def evaluate_candidate(username: str, role_profile: dict) -> dict:
+    """Fetch data, score one candidate, return all results as a dict."""
+    user = get_user(username)
+    repos = get_repos(username)
+    public_events = get_public_events(username)
+
+    print(f"  Inspecting @{user['login']}...", file=sys.stderr)
     repo_signals = collect_repo_signals(repos)
-
-    print(f"\nGitHub profile: @{user['login']}\n")
-    print(f"Role:               {role_profile['label']}")
-    print(f"Top language:       {top_language(repos)}")
-    print(f"Public repos:       {user.get('public_repos', len(repos))}")
-    print(f"Total stars:        {total_stars(repos)}")
-    print(f"Most recent public activity: {most_recent_activity(repos, public_events)}")
-    print("\nTop projects:")
-    for i, repo in enumerate(projects, 1):
-        stars = repo.get("stargazers_count", 0)
-        lang = repo.get("language") or "—"
-        print(f"  {i}. {repo['name']} ({lang}, {stars} stars)")
-        print(f"     {repo.get('html_url', '')}")
 
     lang = top_language(repos)
     act = activity_score(repos, public_events)
@@ -632,13 +631,49 @@ def main() -> None:
     confidence = compute_confidence(repos, repo_signals)
     summary = build_explanation(act, pop, stack, quality, lang, role_profile)
 
+    return {
+        "username": user["login"],
+        "user": user,
+        "repos": repos,
+        "public_events": public_events,
+        "projects": top_projects(repos),
+        "top_lang": lang,
+        "activity": act,
+        "popularity": pop,
+        "stack": stack,
+        "quality": quality,
+        "score": score,
+        "confidence": confidence,
+        "summary": summary,
+    }
+
+
+def print_candidate_report(result: dict, role_profile: dict) -> None:
+    """Full breakdown for a single candidate."""
+    user = result["user"]
+    repos = result["repos"]
+    confidence = result["confidence"]
     w = SCORE_WEIGHTS
+
+    print(f"\nGitHub profile: @{result['username']}\n")
+    print(f"Role:               {role_profile['label']}")
+    print(f"Top language:       {result['top_lang']}")
+    print(f"Public repos:       {user.get('public_repos', len(repos))}")
+    print(f"Total stars:        {total_stars(repos)}")
+    print(f"Most recent public activity: {most_recent_activity(repos, result.get('public_events'))}")
+    print("\nTop projects:")
+    for i, repo in enumerate(result["projects"], 1):
+        stars = repo.get("stargazers_count", 0)
+        lang = repo.get("language") or "—"
+        print(f"  {i}. {repo['name']} ({lang}, {stars} stars)")
+        print(f"     {repo.get('html_url', '')}")
+
     print(f"\n--- Evaluation ({role_profile['label']}) ---")
-    print(f"Public Activity Score: {act}/100  (weight {int(w['activity'] * 100)}%, public data only)")
-    print(f"Popularity score:      {pop}/100  (weight {int(w['popularity'] * 100)}%)")
-    print(f"Stack match score:     {stack}/100  (weight {int(w['stack'] * 100)}%)")
-    print(f"Project quality score: {quality}/100  (weight {int(w['quality'] * 100)}%)")
-    print(f"\nScore: {score}/100")
+    print(f"Public Activity Score: {result['activity']}/100  (weight {int(w['activity'] * 100)}%, public data only)")
+    print(f"Popularity score:      {result['popularity']}/100  (weight {int(w['popularity'] * 100)}%)")
+    print(f"Stack match score:     {result['stack']}/100  (weight {int(w['stack'] * 100)}%)")
+    print(f"Project quality score: {result['quality']}/100  (weight {int(w['quality'] * 100)}%)")
+    print(f"\nScore: {result['score']}/100")
     print(f"Confidence: {confidence['level']} ({confidence['score']}/100)")
     print(
         f"  Evidence: {confidence['repo_count']} public repos, "
@@ -648,7 +683,52 @@ def main() -> None:
     )
     if confidence["level"] == "Low":
         print("  Note: Limited public data — treat this score as a rough signal.")
-    print(summary)
+    print(result["summary"])
+
+
+def print_leaderboard(results: list[dict], role_profile: dict) -> None:
+    """Ranked list when comparing multiple candidates for the same role."""
+    print(f"\n{'=' * 60}")
+    print(f"LEADERBOARD — {role_profile['label']}")
+    print(f"{'=' * 60}\n")
+
+    for rank, result in enumerate(results, 1):
+        conf = result["confidence"]
+        print(f"#{rank}  @{result['username']}")
+        print(f"     Score: {result['score']}/100  |  Confidence: {conf['level']}")
+        print(f"     {result['summary']}")
+        print()
+
+
+def main() -> None:
+    role_profile, usernames = parse_cli(sys.argv)
+    results: list[dict] = []
+
+    print(f"\nEvaluating {len(usernames)} candidate(s) for {role_profile['label']}...\n", file=sys.stderr)
+
+    for username in usernames:
+        try:
+            result = evaluate_candidate(username, role_profile)
+            results.append(result)
+        except requests.HTTPError as e:
+            message = e.response.json().get("message", str(e)) if e.response else str(e)
+            print(f"  Skipped @{username}: {e.response.status_code} — {message}", file=sys.stderr)
+
+    if not results:
+        print("No candidates could be evaluated.")
+        sys.exit(1)
+
+    # Sort by score (highest first); use confidence as tiebreaker
+    results.sort(key=lambda r: (r["score"], r["confidence"]["score"]), reverse=True)
+
+    # One candidate: show full report. Several: show brief per-person + leaderboard.
+    if len(results) == 1:
+        print_candidate_report(results[0], role_profile)
+    else:
+        for result in results:
+            conf = result["confidence"]
+            print(f"@{result['username']}: {result['score']}/100 (Confidence: {conf['level']})")
+        print_leaderboard(results, role_profile)
 
 
 if __name__ == "__main__":
