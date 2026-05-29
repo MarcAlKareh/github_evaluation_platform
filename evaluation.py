@@ -1,14 +1,12 @@
 """
 GitHub candidate evaluation — fetch public profile data and score role fit.
 
-Usage:
-    python evaluation.py <username> [role]
-
 Roles: backend, frontend, ml, devops
 """
 
 import os
 import sys
+import time
 from collections import Counter
 from datetime import datetime, timezone
 
@@ -68,6 +66,19 @@ ROLE_PROFILES = {
             "prometheus", "grafana", "devops", "deployment",
         ],
     },
+}
+
+# How many top repos to open via the Contents API (each may need 2–3 calls)
+INSPECT_REPO_LIMIT = 8
+
+# If a repo contains these files, we treat them as hints for role stack matching
+SIGNAL_TO_KEYWORDS = {
+    "has_package_json": ["javascript", "typescript", "react", "vue", "frontend", "node", "express"],
+    "has_requirements_txt": ["python", "django", "flask", "fastapi", "pytest", "backend"],
+    "has_dockerfile": ["docker", "devops", "deployment", "kubernetes", "ci/cd"],
+    "has_workflows": ["ci/cd", "github actions", "devops", "deployment"],
+    "has_notebooks": ["notebook", "ml", "machine learning", "pytorch", "tensorflow", "pandas"],
+    "has_tests": ["pytest", "testing", "backend"],
 }
 
 
@@ -152,6 +163,103 @@ def top_projects(repos: list[dict], limit: int = 5) -> list[dict]:
     return ranked[:limit]
 
 
+def _list_repo_paths(owner: str, repo: str, path: str = "") -> list[str]:
+    """
+    List file/folder names at a path in a repo (GitHub Contents API).
+
+    Returns an empty list if the path is missing or the repo is empty.
+    """
+    url = f"{BASE_URL}/repos/{owner}/{repo}/contents"
+    if path:
+        url += f"/{path}"
+    response = requests.get(url, headers=headers, timeout=30)
+    if response.status_code == 404:
+        return []
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, list):
+        return []
+    return [item.get("name", "") for item in data]
+
+
+def inspect_repo_engineering_signals(full_name: str) -> dict[str, bool]:
+    """
+    Check a repo's root (and .github/workflows) for common engineering files.
+
+    We only look at names, not file contents — keeps this fast and simple.
+    """
+    owner, repo = full_name.split("/", 1)
+    root_names = _list_repo_paths(owner, repo)
+    root_lower = {name.lower() for name in root_names}
+
+    signals = {
+        "has_package_json": "package.json" in root_lower,
+        # Python deps: requirements.txt or pyproject.toml
+        "has_requirements_txt": (
+            "requirements.txt" in root_lower or "pyproject.toml" in root_lower
+        ),
+        "has_dockerfile": any(
+            name == "dockerfile" or name.startswith("dockerfile")
+            for name in root_lower
+        ),
+        "has_workflows": False,
+        "has_notebooks": any(name.endswith(".ipynb") for name in root_names),
+        "has_tests": False,
+    }
+
+    # Notebook folder (common in ML repos)
+    if "notebooks" in root_lower:
+        signals["has_notebooks"] = True
+
+    # Testing: folder names or common config files at repo root
+    test_names = {"tests", "test", "__tests__", "pytest.ini", "tox.ini", "conftest.py"}
+    signals["has_tests"] = bool(root_lower & test_names)
+
+    # CI/CD: .github/workflows/*.yml (one extra API call if .github exists)
+    if ".github" in root_lower:
+        github_items = _list_repo_paths(owner, repo, ".github")
+        if "workflows" in {name.lower() for name in github_items}:
+            workflow_files = _list_repo_paths(owner, repo, ".github/workflows")
+            signals["has_workflows"] = len(workflow_files) > 0
+
+    return signals
+
+
+def collect_repo_signals(repos: list[dict], limit: int = INSPECT_REPO_LIMIT) -> dict[str, dict[str, bool]]:
+    """
+    Inspect the top public repos and return {full_name: signals}.
+
+    We skip archived repos and cap how many we open to avoid rate limits.
+    """
+    pool = [r for r in repos if not r.get("archived")]
+    to_inspect = top_projects(pool, limit=limit)
+    signals_by_repo: dict[str, dict[str, bool]] = {}
+
+    for repo in to_inspect:
+        full_name = repo["full_name"]
+        try:
+            signals_by_repo[full_name] = inspect_repo_engineering_signals(full_name)
+        except requests.HTTPError:
+            # Empty repo or no permission — treat as no signals
+            signals_by_repo[full_name] = {}
+        time.sleep(0.1)
+
+    return signals_by_repo
+
+
+def _signals_match_role(signals: dict[str, bool], role_keywords: list[str]) -> bool:
+    """True if any detected file hint overlaps this role's keyword list."""
+    if not signals:
+        return False
+    for signal_key, hint_words in SIGNAL_TO_KEYWORDS.items():
+        if not signals.get(signal_key):
+            continue
+        for hint in hint_words:
+            if any(hint in kw or kw in hint for kw in role_keywords):
+                return True
+    return False
+
+
 def _days_since(iso_date: str) -> int | None:
     try:
         dt = datetime.fromisoformat(iso_date.replace("Z", "+00:00"))
@@ -216,22 +324,28 @@ def popularity_score(repos: list[dict]) -> int:
     return 10
 
 
-def stack_match_score(repos: list[dict], role_profile: dict) -> int:
+def stack_match_score(
+    repos: list[dict],
+    role_profile: dict,
+    repo_signals: dict[str, dict[str, bool]] | None = None,
+) -> int:
     """
     Compare repos against a role profile.
 
     - language match: repo's main language is in preferred_languages
-    - keyword match: role keywords appear in name, description, or topics
-  """
+    - keyword match: role keywords in name, description, or topics
+    - content match: files like package.json / requirements.txt fit the role
+    """
     if not repos:
         return 0
 
-    # Normalize preferred languages for easy comparison (e.g. "python" == "Python")
+    repo_signals = repo_signals or {}
     preferred = {lang.lower() for lang in role_profile["preferred_languages"]}
     keywords = [kw.lower() for kw in role_profile["keywords"]]
 
     language_matches = 0
     keyword_matches = 0
+    content_matches = 0
 
     for repo in repos:
         lang = (repo.get("language") or "").lower()
@@ -239,23 +353,34 @@ def stack_match_score(repos: list[dict], role_profile: dict) -> int:
         desc = (repo.get("description") or "").lower()
         topics = " ".join(repo.get("topics") or []).lower()
         text = f"{name} {desc} {topics}"
+        signals = repo_signals.get(repo.get("full_name", ""), {})
 
         if lang in preferred:
             language_matches += 1
         if any(kw in text for kw in keywords):
             keyword_matches += 1
+        if _signals_match_role(signals, keywords):
+            content_matches += 1
 
-    # What fraction of repos fit this role?
     language_ratio = language_matches / len(repos)
     keyword_ratio = keyword_matches / len(repos)
+    content_ratio = content_matches / len(repos)
 
-    # Languages matter slightly more than keywords in the name/description
-    score = int(language_ratio * 55 + keyword_ratio * 45)
-    return min(100, score)
+    # Base score from metadata; up to +15 from real files in the repo
+    base = language_ratio * 55 + keyword_ratio * 45
+    bonus = content_ratio * 15
+    return min(100, int(base + bonus))
 
 
-def project_quality_score(repos: list[dict]) -> int:
-    """Points for descriptions, size, and signs the repo is a real project."""
+def project_quality_score(
+    repos: list[dict],
+    repo_signals: dict[str, dict[str, bool]] | None = None,
+) -> int:
+    """
+    Points for metadata (description, size, stars) plus engineering files
+    when we inspected the repo (tests, CI, Docker, dependency manifests).
+    """
+    repo_signals = repo_signals or {}
     pool = [r for r in repos if not r.get("fork")] or repos
     if not pool:
         return 0
@@ -264,14 +389,27 @@ def project_quality_score(repos: list[dict]) -> int:
     for repo in pool:
         points = 0
         if repo.get("description"):
-            points += 25
+            points += 20
         if not repo.get("archived"):
-            points += 25
+            points += 20
         if (repo.get("size") or 0) >= 20:
-            points += 25
+            points += 20
         if (repo.get("stargazers_count") or 0) > 0 or (repo.get("forks_count") or 0) > 0:
-            points += 25
-        repo_scores.append(points)
+            points += 20
+
+        signals = repo_signals.get(repo.get("full_name", ""), {})
+        if signals.get("has_tests"):
+            points += 10
+        if signals.get("has_workflows"):
+            points += 10
+        if signals.get("has_dockerfile"):
+            points += 8
+        if signals.get("has_package_json") or signals.get("has_requirements_txt"):
+            points += 7
+        if signals.get("has_notebooks"):
+            points += 5
+
+        repo_scores.append(min(100, points))
 
     repo_scores.sort(reverse=True)
     top = repo_scores[:5]
@@ -364,6 +502,9 @@ def main() -> None:
 
     projects = top_projects(repos)
 
+    print("Inspecting top repos for engineering signals...", file=sys.stderr)
+    repo_signals = collect_repo_signals(repos)
+
     print(f"\nGitHub profile: @{user['login']}\n")
     print(f"Role:               {role_profile['label']}")
     print(f"Top language:       {top_language(repos)}")
@@ -380,8 +521,8 @@ def main() -> None:
     lang = top_language(repos)
     act = activity_score(repos, public_events)
     pop = popularity_score(repos)
-    stack = stack_match_score(repos, role_profile)
-    quality = project_quality_score(repos)
+    stack = stack_match_score(repos, role_profile, repo_signals)
+    quality = project_quality_score(repos, repo_signals)
     score = final_score(act, pop, stack, quality)
     summary = build_explanation(act, pop, stack, quality, lang, role_profile)
 
