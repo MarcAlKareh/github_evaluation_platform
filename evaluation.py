@@ -416,8 +416,113 @@ def project_quality_score(
     return int(sum(top) / len(top))
 
 
+# How much each category affects the final score (must add up to 1.0).
+# Stack + quality use repo contents and metadata — most reliable from public data.
+# Activity is public-only and often low for strong engineers in private work — lowest weight.
+SCORE_WEIGHTS = {
+    "activity": 0.15,
+    "popularity": 0.20,
+    "stack": 0.35,
+    "quality": 0.30,
+}
+
+
 def final_score(activity: int, popularity: int, stack: int, quality: int) -> int:
-    return round((activity + popularity + stack + quality) / 4)
+    w = SCORE_WEIGHTS
+    weighted = (
+        activity * w["activity"]
+        + popularity * w["popularity"]
+        + stack * w["stack"]
+        + quality * w["quality"]
+    )
+    return round(weighted)
+
+
+def compute_confidence(
+    repos: list[dict],
+    repo_signals: dict[str, dict[str, bool]],
+) -> dict:
+    """
+    How much public evidence we had to score this candidate.
+
+    A score from 2 repos is a guess; a score from 50 repos + file inspection
+  is much more trustworthy. This does NOT change the fit score — it labels
+    how much to trust it when ranking people.
+    """
+    repo_count = len(repos)
+    inspected_count = len(repo_signals)
+
+    # Repos with useful metadata (description, language, or topics)
+    metadata_rich = 0
+    for repo in repos:
+        has_meta = sum(
+            [
+                bool(repo.get("description")),
+                bool(repo.get("language")),
+                bool(repo.get("topics")),
+            ]
+        )
+        if has_meta >= 2:
+            metadata_rich += 1
+
+    # Total engineering file flags found across inspected repos
+    signal_count = sum(
+        sum(1 for flag in signals.values() if flag)
+        for signals in repo_signals.values()
+    )
+
+    points = 0
+
+    # 1) More public repos → more stable averages (up to 30 pts)
+    if repo_count >= 30:
+        points += 30
+    elif repo_count >= 10:
+        points += 22
+    elif repo_count >= 5:
+        points += 15
+    elif repo_count >= 2:
+        points += 8
+
+    # 2) How many repos we opened via the Contents API (up to 25 pts)
+    if inspected_count >= INSPECT_REPO_LIMIT:
+        points += 25
+    elif inspected_count >= 5:
+        points += 18
+    elif inspected_count >= 1:
+        points += 10
+
+    # 3) Share of repos with decent metadata (up to 25 pts)
+    if repo_count > 0:
+        metadata_ratio = metadata_rich / repo_count
+        points += int(metadata_ratio * 25)
+
+    # 4) Engineering signals detected in files (up to 20 pts)
+    if signal_count >= 15:
+        points += 20
+    elif signal_count >= 8:
+        points += 14
+    elif signal_count >= 3:
+        points += 8
+    elif signal_count >= 1:
+        points += 4
+
+    confidence_score = min(100, points)
+
+    if confidence_score >= 70:
+        level = "High"
+    elif confidence_score >= 40:
+        level = "Medium"
+    else:
+        level = "Low"
+
+    return {
+        "level": level,
+        "score": confidence_score,
+        "repo_count": repo_count,
+        "inspected_count": inspected_count,
+        "metadata_rich": metadata_rich,
+        "signal_count": signal_count,
+    }
 
 
 def build_explanation(
@@ -524,14 +629,25 @@ def main() -> None:
     stack = stack_match_score(repos, role_profile, repo_signals)
     quality = project_quality_score(repos, repo_signals)
     score = final_score(act, pop, stack, quality)
+    confidence = compute_confidence(repos, repo_signals)
     summary = build_explanation(act, pop, stack, quality, lang, role_profile)
 
+    w = SCORE_WEIGHTS
     print(f"\n--- Evaluation ({role_profile['label']}) ---")
-    print(f"Activity score:        {act}/100  (public repos + public events only)")
-    print(f"Popularity score:      {pop}/100")
-    print(f"Stack match score:     {stack}/100")
-    print(f"Project quality score: {quality}/100")
+    print(f"Public Activity Score: {act}/100  (weight {int(w['activity'] * 100)}%, public data only)")
+    print(f"Popularity score:      {pop}/100  (weight {int(w['popularity'] * 100)}%)")
+    print(f"Stack match score:     {stack}/100  (weight {int(w['stack'] * 100)}%)")
+    print(f"Project quality score: {quality}/100  (weight {int(w['quality'] * 100)}%)")
     print(f"\nScore: {score}/100")
+    print(f"Confidence: {confidence['level']} ({confidence['score']}/100)")
+    print(
+        f"  Evidence: {confidence['repo_count']} public repos, "
+        f"{confidence['inspected_count']} inspected, "
+        f"{confidence['metadata_rich']} with rich metadata, "
+        f"{confidence['signal_count']} file signals detected."
+    )
+    if confidence["level"] == "Low":
+        print("  Note: Limited public data — treat this score as a rough signal.")
     print(summary)
 
 
