@@ -2,12 +2,13 @@
 GitHub candidate evaluation — fetch public profile data and score role fit.
 
 Usage:
-    python evaluation.py <role> <username1> [username2] ...
-    python evaluation.py torvalds backend          (legacy: username then role)
+    python evaluation.py <role> <username1> [username2] ... [--json]
+    python evaluation.py torvalds backend [--json]   (legacy: username then role)
 
 Roles: backend, frontend, ml, devops
 """
 
+import json
 import os
 import sys
 import time
@@ -576,41 +577,44 @@ def build_explanation(
     return text[0].upper() + text[1:] + "."
 
 
-def parse_cli(argv: list[str]) -> tuple[dict, list[str]]:
+def parse_cli(argv: list[str]) -> tuple[dict, list[str], bool, str]:
     """
-    Parse command-line args into a role profile and one or more usernames.
+    Parse command-line args into a role profile, usernames, and --json flag.
 
-    Preferred:  python evaluation.py frontend gaearon torvalds
+    Preferred:  python evaluation.py frontend gaearon torvalds --json
     Legacy:     python evaluation.py gaearon frontend
                 python evaluation.py gaearon
     """
+    json_output = "--json" in argv
+    args = [arg for arg in argv if arg != "--json"]
+
     valid_roles = set(ROLE_PROFILES.keys())
 
-    if len(argv) < 2:
+    if len(args) < 2:
         valid = ", ".join(ROLE_PROFILES.keys())
-        print(f"Usage: python evaluation.py <role> <username1> [username2] ...")
+        print(f"Usage: python evaluation.py <role> <username1> [username2] ... [--json]")
         print(f"Roles: {valid}")
         sys.exit(1)
 
-    first = argv[1].lower()
+    first = args[1].lower()
 
     # New style: role first, then all usernames
     if first in valid_roles:
         role_key = first
-        usernames = [name.lstrip("@") for name in argv[2:]]
+        usernames = [name.lstrip("@") for name in args[2:]]
     # Legacy: username first, optional role as second arg
-    elif len(argv) > 2 and argv[2].lower() in valid_roles:
-        role_key = argv[2].lower()
-        usernames = [argv[1].lstrip("@")]
+    elif len(args) > 2 and args[2].lower() in valid_roles:
+        role_key = args[2].lower()
+        usernames = [args[1].lstrip("@")]
     else:
         role_key = "backend"
-        usernames = [argv[1].lstrip("@")]
+        usernames = [args[1].lstrip("@")]
 
     if not usernames:
         print("Error: provide at least one GitHub username after the role.")
         sys.exit(1)
 
-    return ROLE_PROFILES[role_key], usernames
+    return ROLE_PROFILES[role_key], usernames, json_output, role_key
 
 
 def evaluate_candidate(username: str, role_profile: dict) -> dict:
@@ -686,6 +690,54 @@ def print_candidate_report(result: dict, role_profile: dict) -> None:
     print(result["summary"])
 
 
+def build_json_report(results: list[dict], role_profile: dict, role_key: str) -> dict:
+    """Build a JSON-serializable report for APIs and frontends."""
+    ranking = []
+    for rank, result in enumerate(results, 1):
+        user = result["user"]
+        repos = result["repos"]
+        ranking.append(
+            {
+                "rank": rank,
+                "username": result["username"],
+                "score": result["score"],
+                "summary": result["summary"],
+                "confidence": result["confidence"],
+                "scores": {
+                    "public_activity": result["activity"],
+                    "popularity": result["popularity"],
+                    "stack_match": result["stack"],
+                    "project_quality": result["quality"],
+                },
+                "profile": {
+                    "top_language": result["top_lang"],
+                    "public_repos": user.get("public_repos", len(repos)),
+                    "total_stars": total_stars(repos),
+                    "most_recent_public_activity": most_recent_activity(
+                        repos, result.get("public_events")
+                    ),
+                },
+                "top_projects": [
+                    {
+                        "name": repo["name"],
+                        "language": repo.get("language"),
+                        "stars": repo.get("stargazers_count", 0),
+                        "url": repo.get("html_url", ""),
+                    }
+                    for repo in result["projects"]
+                ],
+            }
+        )
+
+    return {
+        "role": role_key,
+        "role_label": role_profile["label"],
+        "weights": SCORE_WEIGHTS,
+        "candidate_count": len(ranking),
+        "ranking": ranking,
+    }
+
+
 def print_leaderboard(results: list[dict], role_profile: dict) -> None:
     """Ranked list when comparing multiple candidates for the same role."""
     print(f"\n{'=' * 60}")
@@ -701,7 +753,7 @@ def print_leaderboard(results: list[dict], role_profile: dict) -> None:
 
 
 def main() -> None:
-    role_profile, usernames = parse_cli(sys.argv)
+    role_profile, usernames, json_output, role_key = parse_cli(sys.argv)
     results: list[dict] = []
 
     print(f"\nEvaluating {len(usernames)} candidate(s) for {role_profile['label']}...\n", file=sys.stderr)
@@ -715,11 +767,16 @@ def main() -> None:
             print(f"  Skipped @{username}: {e.response.status_code} — {message}", file=sys.stderr)
 
     if not results:
-        print("No candidates could be evaluated.")
+        print("No candidates could be evaluated.", file=sys.stderr if json_output else sys.stdout)
         sys.exit(1)
 
     # Sort by score (highest first); use confidence as tiebreaker
     results.sort(key=lambda r: (r["score"], r["confidence"]["score"]), reverse=True)
+
+    if json_output:
+        report = build_json_report(results, role_profile, role_key)
+        print(json.dumps(report, indent=2))
+        return
 
     # One candidate: show full report. Several: show brief per-person + leaderboard.
     if len(results) == 1:
