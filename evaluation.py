@@ -652,6 +652,41 @@ def evaluate_candidate(username: str, role_profile: dict) -> dict:
     }
 
 
+def run_evaluation(role_key: str, usernames: list[str]) -> dict:
+    """
+    Evaluate and rank candidates — used by CLI (--json) and the FastAPI server.
+
+    Returns the same JSON shape as --json. Failed usernames are listed under "errors".
+    """
+    role_key = role_key.lower()
+    if role_key not in ROLE_PROFILES:
+        raise ValueError(f"Unknown role '{role_key}'. Choose: {', '.join(ROLE_PROFILES)}")
+
+    role_profile = ROLE_PROFILES[role_key]
+    results: list[dict] = []
+    errors: list[dict] = []
+
+    for username in usernames:
+        clean = username.lstrip("@")
+        try:
+            results.append(evaluate_candidate(clean, role_profile))
+        except requests.HTTPError as e:
+            message = e.response.json().get("message", str(e)) if e.response else str(e)
+            errors.append(
+                {
+                    "username": clean,
+                    "status_code": e.response.status_code if e.response else None,
+                    "message": message,
+                }
+            )
+
+    results.sort(key=lambda r: (r["score"], r["confidence"]["score"]), reverse=True)
+    report = build_json_report(results, role_profile, role_key)
+    if errors:
+        report["errors"] = errors
+    return report
+
+
 def print_candidate_report(result: dict, role_profile: dict) -> None:
     """Full breakdown for a single candidate."""
     user = result["user"]
@@ -754,31 +789,31 @@ def print_leaderboard(results: list[dict], role_profile: dict) -> None:
 
 def main() -> None:
     role_profile, usernames, json_output, role_key = parse_cli(sys.argv)
-    results: list[dict] = []
 
     print(f"\nEvaluating {len(usernames)} candidate(s) for {role_profile['label']}...\n", file=sys.stderr)
 
+    if json_output:
+        report = run_evaluation(role_key, usernames)
+        if not report.get("ranking"):
+            print("No candidates could be evaluated.", file=sys.stderr)
+            sys.exit(1)
+        print(json.dumps(report, indent=2))
+        return
+
+    results: list[dict] = []
     for username in usernames:
         try:
-            result = evaluate_candidate(username, role_profile)
-            results.append(result)
+            results.append(evaluate_candidate(username, role_profile))
         except requests.HTTPError as e:
             message = e.response.json().get("message", str(e)) if e.response else str(e)
             print(f"  Skipped @{username}: {e.response.status_code} — {message}", file=sys.stderr)
 
     if not results:
-        print("No candidates could be evaluated.", file=sys.stderr if json_output else sys.stdout)
+        print("No candidates could be evaluated.")
         sys.exit(1)
 
-    # Sort by score (highest first); use confidence as tiebreaker
     results.sort(key=lambda r: (r["score"], r["confidence"]["score"]), reverse=True)
 
-    if json_output:
-        report = build_json_report(results, role_profile, role_key)
-        print(json.dumps(report, indent=2))
-        return
-
-    # One candidate: show full report. Several: show brief per-person + leaderboard.
     if len(results) == 1:
         print_candidate_report(results[0], role_profile)
     else:
