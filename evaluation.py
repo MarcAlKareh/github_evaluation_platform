@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 GitHub candidate evaluation — fetch public profile data and score role fit.
 
@@ -74,7 +76,7 @@ ROLE_PROFILES = {
 }
 
 # How many top repos to open via the Contents API (each may need 2–3 calls)
-INSPECT_REPO_LIMIT = 8
+INSPECT_REPO_LIMIT = 20
 
 # If a repo contains these files, we treat them as hints for role stack matching
 SIGNAL_TO_KEYWORDS = {
@@ -237,7 +239,10 @@ def collect_repo_signals(repos: list[dict], limit: int = INSPECT_REPO_LIMIT) -> 
     We skip archived repos and cap how many we open to avoid rate limits.
     """
     pool = [r for r in repos if not r.get("archived")]
-    to_inspect = top_projects(pool, limit=limit)
+    to_inspect = sorted(pool, key=lambda r: (
+        (r.get("stargazers_count") or 0) * 0.5 +
+        (1 if r.get("pushed_at", "") > "2024-01-01" else 0) * 50
+    ), reverse=True)[:limit]
     signals_by_repo: dict[str, dict[str, bool]] = {}
 
     for repo in to_inspect:
@@ -247,7 +252,7 @@ def collect_repo_signals(repos: list[dict], limit: int = INSPECT_REPO_LIMIT) -> 
         except requests.HTTPError:
             # Empty repo or no permission — treat as no signals
             signals_by_repo[full_name] = {}
-        time.sleep(0.1)
+        time.sleep(0.05)
 
     return signals_by_repo
 
@@ -489,7 +494,7 @@ def compute_confidence(
         points += 8
 
     # 2) How many repos we opened via the Contents API (up to 25 pts)
-    if inspected_count >= INSPECT_REPO_LIMIT:
+    if inspected_count >= min(INSPECT_REPO_LIMIT, len(repos)):
         points += 25
     elif inspected_count >= 5:
         points += 18
