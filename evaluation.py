@@ -427,13 +427,13 @@ def project_quality_score(
 
 
 # How much each category affects the final score (must add up to 1.0).
-# Stack + quality use repo contents and metadata — most reliable from public data.
-# Activity is public-only and often low for strong engineers in private work — lowest weight.
+# Stack + quality are the strongest hiring signals from public GitHub data.
+# Activity is public-only; popularity (stars) is a weak signal — both down-weighted.
 SCORE_WEIGHTS = {
-    "activity": 0.15,
-    "popularity": 0.20,
-    "stack": 0.35,
-    "quality": 0.30,
+    "activity": 0.10,
+    "popularity": 0.15,
+    "stack": 0.40,
+    "quality": 0.35,
 }
 
 
